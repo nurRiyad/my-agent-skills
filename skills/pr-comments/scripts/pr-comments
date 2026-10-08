@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Print conversation comments, submitted reviews, and resolved/open review threads."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def gh_env():
+    # gh color and the pager can hide or corrupt JSON when this runs from an agent.
+    return {
+        **os.environ,
+        "GH_PAGER": "",
+        "GH_FORCE_TTY": "0",
+        "PAGER": "cat",
+        "NO_COLOR": "1",
+        "CLICOLOR": "0",
+    }
+
+QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $commentCursor: String, $threadCursor: String, $reviewCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      title
+      url
+      state
+      isDraft
+      reviewDecision
+      author { login }
+      reviewRequests(first: 30) {
+        nodes {
+          requestedReviewer {
+            ... on User { login }
+            ... on Team { name }
+          }
+        }
+      }
+      comments(first: 100, after: $commentCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login } createdAt body }
+      }
+      reviews(first: 100, after: $reviewCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login } state submittedAt body }
+      }
+      reviewThreads(first: 100, after: $threadCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          comments(first: 50) {
+            nodes { author { login } createdAt body }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def gh_graphql(owner, name, number, comment_cursor, thread_cursor, review_cursor):
+    command = [
+        "gh", "api", "graphql",
+        "-f", f"query={QUERY}",
+        "-f", f"owner={owner}",
+        "-f", f"name={name}",
+        "-F", f"number={number}",
+    ]
+    if comment_cursor:
+        command.extend(["-f", f"commentCursor={comment_cursor}"])
+    if thread_cursor:
+        command.extend(["-f", f"threadCursor={thread_cursor}"])
+    if review_cursor:
+        command.extend(["-f", f"reviewCursor={review_cursor}"])
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=gh_env(),
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr or result.stdout)
+        raise SystemExit(result.returncode or 1)
+    payload = json.loads(ANSI.sub("", result.stdout))
+    if payload.get("errors"):
+        sys.stderr.write(json.dumps(payload["errors"], indent=2) + "\n")
+        raise SystemExit(1)
+    return payload["data"]["repository"]["pullRequest"]
+
+
+def gh_text(*args):
+    result = subprocess.run(
+        ["gh", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=gh_env(),
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr or result.stdout)
+        raise SystemExit(result.returncode or 1)
+    return result.stdout.strip()
+
+
+def resolve(raw):
+    if not raw:
+        repo = gh_text("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+        number = gh_text("pr", "view", "--json", "number", "-q", ".number")
+        owner, name = repo.split("/", 1)
+        return owner, name, number
+    match = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", raw)
+    if match:
+        return match.group(1), match.group(2), match.group(3)
+    match = re.fullmatch(r"([^/\s]+)/([^#\s]+)#(\d+)", raw)
+    if match:
+        return match.group(1), match.group(2), match.group(3)
+    if re.fullmatch(r"\d+", raw):
+        repo = gh_text("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
+        owner, name = repo.split("/", 1)
+        return owner, name, raw
+    raise SystemExit(
+        "Usage: pr-comments <url | owner/repo#number | number>\n"
+        f"Could not parse: {raw}"
+    )
+
+
+def take_pages(owner, name, number):
+    comments = []
+    reviews = []
+    threads = []
+    comment_cursor = None
+    review_cursor = None
+    thread_cursor = None
+    comments_done = False
+    reviews_done = False
+    threads_done = False
+    pull = None
+    for _ in range(20):
+        page = gh_graphql(
+            owner,
+            name,
+            number,
+            None if comments_done else comment_cursor,
+            None if threads_done else thread_cursor,
+            None if reviews_done else review_cursor,
+        )
+        pull = page
+        if not comments_done:
+            comment_page = page["comments"]
+            comments.extend(comment_page["nodes"])
+            if comment_page["pageInfo"]["hasNextPage"]:
+                comment_cursor = comment_page["pageInfo"]["endCursor"]
+            else:
+                comments_done = True
+        if not reviews_done:
+            review_page = page["reviews"]
+            reviews.extend(review_page["nodes"])
+            if review_page["pageInfo"]["hasNextPage"]:
+                review_cursor = review_page["pageInfo"]["endCursor"]
+            else:
+                reviews_done = True
+        if not threads_done:
+            thread_page = page["reviewThreads"]
+            threads.extend(thread_page["nodes"])
+            if thread_page["pageInfo"]["hasNextPage"]:
+                thread_cursor = thread_page["pageInfo"]["endCursor"]
+            else:
+                threads_done = True
+        if comments_done and reviews_done and threads_done:
+            break
+    return pull, comments, reviews, threads
+
+
+def reviewer_name(node):
+    reviewer = (node or {}).get("requestedReviewer") or {}
+    return reviewer.get("login") or reviewer.get("name")
+
+
+def print_body(body):
+    text = (body or "").strip()
+    print(text or "(empty)")
+
+
+def main():
+    raw = sys.argv[1] if len(sys.argv) > 1 else ""
+    owner, name, number = resolve(raw)
+    pull, comments, reviews, threads = take_pages(owner, name, number)
+    if pull is None:
+        raise SystemExit(f"Pull request not found: {owner}/{name}#{number}")
+
+    open_threads = [thread for thread in threads if not thread.get("isResolved")]
+    resolved_threads = [thread for thread in threads if thread.get("isResolved")]
+    reviewers = [name for name in (reviewer_name(node) for node in pull["reviewRequests"]["nodes"]) if name]
+
+    print(f"# {pull.get('title')}")
+    print(pull.get("url"))
+    author = (pull.get("author") or {}).get("login", "unknown")
+    print(
+        f"Author: {author}  State: {pull.get('state')}  "
+        f"Draft: {pull.get('isDraft')}  Review decision: {pull.get('reviewDecision')}"
+    )
+    print(f"Requested reviewers: {', '.join(reviewers) if reviewers else 'none'}")
+    print(f"Review threads: {len(open_threads)} open, {len(resolved_threads)} resolved")
+    print()
+
+    print(f"## Conversation comments ({len(comments)})")
+    if not comments:
+        print("None.")
+    for index, comment in enumerate(comments, 1):
+        user = (comment.get("author") or {}).get("login", "unknown")
+        print(f"\n{index}. {user} — {comment.get('createdAt')}")
+        print_body(comment.get("body"))
+
+    print(f"\n## Submitted reviews ({len(reviews)})")
+    if not reviews:
+        print("None.")
+    for index, review in enumerate(reviews, 1):
+        user = (review.get("author") or {}).get("login", "unknown")
+        print(f"\n{index}. {user} — {review.get('state')} — {review.get('submittedAt')}")
+        print_body(review.get("body"))
+
+    print_threads("Open review threads", open_threads)
+    print_threads("Resolved review threads", resolved_threads)
+
+
+def print_threads(title, threads):
+    print(f"\n## {title} ({len(threads)})")
+    if not threads:
+        print("None.")
+        return
+    for index, thread in enumerate(threads, 1):
+        path = thread.get("path") or "?"
+        line = thread.get("line") or thread.get("originalLine") or "?"
+        outdated = "outdated" if thread.get("isOutdated") else "current"
+        print(f"\n{index}. {path}:{line} ({outdated})")
+        for comment in thread.get("comments", {}).get("nodes") or []:
+            user = (comment.get("author") or {}).get("login", "unknown")
+            print(f"- {user} — {comment.get('createdAt')}")
+            print_body(comment.get("body"))
+            print()
+
+
+if __name__ == "__main__":
+    main()

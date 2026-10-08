@@ -27,6 +27,8 @@ machine-specific paths, credentials, and other secrets out of skills.
 
 - [`pr-body`](./skills/pr-body/SKILL.md): draft a pull request body from a branch
   diff and the repository's PR template.
+- [`pr-comments`](./skills/pr-comments/SKILL.md): fetch and summarize pull
+  request comments, reviews, and open or resolved review threads.
 
 ## Use this repository
 
