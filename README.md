@@ -23,6 +23,11 @@ The `name` must be lowercase kebab-case and match the skill folder name. Make
 the description specific so agents can tell when the skill applies. Keep
 machine-specific paths, credentials, and other secrets out of skills.
 
+## Skills in this repository
+
+- [`pr-body`](./skills/pr-body/SKILL.md): draft a pull request body from a branch
+  diff and the repository's PR template.
+
 ## Use this repository
 
 This repository uses Node.js for the skills CLI. The required version is pinned

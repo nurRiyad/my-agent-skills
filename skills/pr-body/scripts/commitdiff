@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Write changes.diff for the current branch against origin/main or origin/master.
+# Usage: commitdiff [repo-path]
+set -euo pipefail
+
+root="${1:-.}"
+if ! git -C "$root" rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "Not a git repo: $root" >&2
+  exit 1
+fi
+root="$(git -C "$root" rev-parse --show-toplevel)"
+cd "$root"
+
+default_branch="origin/main"
+if ! git rev-parse --verify origin/main >/dev/null 2>&1; then
+  if git rev-parse --verify origin/master >/dev/null 2>&1; then
+    default_branch="origin/master"
+  else
+    echo "No origin/main or origin/master in $root. Run git fetch, then try again." >&2
+    exit 1
+  fi
+fi
+
+current_branch="$(git branch --show-current)"
+if [[ -z "$current_branch" ]]; then
+  echo "Detached HEAD in $root. Checkout a branch first." >&2
+  exit 1
+fi
+
+git diff "${default_branch}...${current_branch}" > changes.diff
+echo "Saved diff between ${default_branch} and ${current_branch} to ${root}/changes.diff"
+
+template=""
+candidates=(
+  ".github/pull_request_template.md"
+  ".github/PULL_REQUEST_TEMPLATE.md"
+  "pull_request_template.md"
+  "docs/pull_request_template.md"
+)
+for candidate in "${candidates[@]}"; do
+  if [[ -f "$candidate" ]]; then
+    template="$root/$candidate"
+    break
+  fi
+done
+if [[ -z "$template" && -d .github/PULL_REQUEST_TEMPLATE ]]; then
+  template="$(find .github/PULL_REQUEST_TEMPLATE -maxdepth 1 -type f -name '*.md' | sort | head -1)"
+  if [[ -n "$template" ]]; then
+    template="$root/${template#./}"
+  fi
+fi
+
+if [[ -n "$template" ]]; then
+  echo "PR template: $template"
+else
+  echo "PR template: none"
+fi
